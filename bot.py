@@ -1,8 +1,9 @@
-from os import environ
+  from os import environ
 import asyncio
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, ChatJoinRequest, BotCommand, CallbackQuery
 from motor.motor_asyncio import AsyncIOMotorClient
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- BOT SETUP ---
 pr0fess0r_99 = Client(
@@ -18,12 +19,17 @@ db_client = AsyncIOMotorClient(mongo_url)
 db = db_client.AutoApproveBot
 users_db = db.users
 settings_db = db.settings
+channels_db = db.channels # Target Channels
+posts_db = db.posts        # Master Channel Posts
 
-# --- CONFIG VARS (Heroku se uthayega) ---
+# --- CONFIG VARS ---
 ADMINS = [int(admin) for admin in environ.get("ADMINS", "").split()]
 TEXT = environ.get("APPROVED_WELCOME_TEXT", "Hello {mention}\nWelcome To {title}!")
 UPDATE_CH = environ.get("UPDATE_CH", "https://t.me/Mo_Tech_YT") 
 WELCOME_PIC = environ.get("WELCOME_PIC", "")
+MASTER_CHANNEL_ID = int(environ.get("MASTER_CHANNEL_ID", "0"))
+
+scheduler = AsyncIOScheduler()
 
 # --- HELPERS ---
 async def add_user(user_id):
@@ -39,110 +45,103 @@ async def get_buttons():
         ]
     return btns["data"]
 
-# --- MESSAGE SENDING LOGIC (With Photo & Buttons) ---
+# --- WELCOME MESSAGE LOGIC ---
 async def send_msg_with_media(client, chat_id, mention, title):
     caption_text = TEXT.format(mention=mention, title=title)
     btns_data = await get_buttons()
-    
-    # URL Safety: Agar link khali ho toh crash na ho
     def check_url(url):
         return url if (url and url.startswith("http")) else "https://t.me/telegram"
 
-    # Screenshot wala 5 Button Layout + Close Button
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(btns_data[0]['n1'], url=check_url(btns_data[0]['u1']))],
-        [
-            InlineKeyboardButton(btns_data[1]['n2'], url=check_url(btns_data[1]['u2'])),
-            InlineKeyboardButton(btns_data[1]['n3'], url=check_url(btns_data[1]['u3']))
-        ],
-        [
-            InlineKeyboardButton("Add to Group ➕", url=f"http://t.me/{client.me.username}?startgroup=botstart"),
-            InlineKeyboardButton("Add to Channel 📢", url=f"http://t.me/{client.me.username}?startchannel=botstart")
-        ],
+        [InlineKeyboardButton(btns_data[1]['n2'], url=check_url(btns_data[1]['u2'])),
+         InlineKeyboardButton(btns_data[1]['n3'], url=check_url(btns_data[1]['u3']))],
+        [InlineKeyboardButton("Add to Group ➕", url=f"http://t.me/{client.me.username}?startgroup=botstart")],
         [InlineKeyboardButton("Close ❌", callback_data="close_msg")]
     ])
-
     try:
-        if WELCOME_PIC:
-            await client.send_photo(chat_id, photo=WELCOME_PIC, caption=caption_text, reply_markup=keyboard)
-        else:
-            await client.send_message(chat_id, text=caption_text, reply_markup=keyboard)
-    except Exception as e:
-        print(f"Send Error: {e}")
+        if WELCOME_PIC: await client.send_photo(chat_id, photo=WELCOME_PIC, caption=caption_text, reply_markup=keyboard)
+        else: await client.send_message(chat_id, text=caption_text, reply_markup=keyboard)
+    except: pass
 
-# --- CALLBACKS (Cancel/Close Button ke liye) ---
-@pr0fess0r_99.on_callback_query(filters.regex("close_msg"))
-async def close(client, query: CallbackQuery):
-    await query.message.delete()
+# --- AUTO-POST LOGIC (15 Posts Loop) ---
+async def auto_post_job():
+    all_ch = await channels_db.find().to_list(length=None)
+    all_pst = await posts_db.find().to_list(length=None)
+    if not all_ch or not all_pst: return
 
-# --- MAIN HANDLERS ---
+    data = await settings_db.find_one({"id": "post_index"})
+    idx = data["index"] if data else 0
+
+    for _ in range(15):
+        if idx >= len(all_pst): idx = 0 # Loop back to start
+        p = all_pst[idx]
+        for c in all_ch:
+            try:
+                await pr0fess0r_99.copy_message(chat_id=c["chat_id"], from_chat_id=MASTER_CHANNEL_ID, message_id=p["msg_id"])
+                await asyncio.sleep(1)
+            except: pass
+        idx += 1
+    await settings_db.update_one({"id": "post_index"}, {"$set": {"index": idx}}, upsert=True)
+
+# --- HANDLERS ---
 
 @pr0fess0r_99.on_chat_join_request()
 async def autoapprove(client, message: ChatJoinRequest):
     try:
         await client.approve_chat_join_request(message.chat.id, message.from_user.id)
+        await channels_db.update_one({"chat_id": message.chat.id}, {"$set": {"chat_id": message.chat.id}}, upsert=True)
         await add_user(message.from_user.id)
         await send_msg_with_media(client, message.from_user.id, message.from_user.mention, message.chat.title)
-    except Exception as e:
-        print(f"Approve Error: {e}")
+    except: pass
 
-@pr0fess0r_99.on_message(filters.private & filters.command("start"))
-async def start(client, message: Message):
-    await add_user(message.from_user.id)
-    await send_msg_with_media(client, message.chat.id, message.from_user.mention, "Our Service")
+@pr0fess0r_99.on_message(filters.chat(MASTER_CHANNEL_ID))
+async def save_master_posts(client, message):
+    if not await posts_db.find_one({"msg_id": message.id}):
+        await posts_db.insert_one({"msg_id": message.id})
 
-# --- ADMIN COMMANDS (Sirf aapke liye) ---
-
-@pr0fess0r_99.on_message(filters.command("stats") & filters.user(ADMINS))
-async def stats_handler(client, message):
-    count = await users_db.count_documents({})
-    await message.reply_text(f"📊 **Bot Current Status**\n\nTotal Users: `{count}`\nDatabase: `MongoDB Active`")
-
-@pr0fess0r_99.on_message(filters.command("broadcast") & filters.user(ADMINS) & filters.reply)
-async def broadcast_handler(client, message):
-    all_users = users_db.find({})
-    msg = await message.reply_text("🚀 **Broadcast started...**")
-    count, deleted = 0, 0
-    async for user in all_users:
+@pr0fess0r_99.on_message(filters.command("settime") & filters.user(ADMINS))
+async def set_time(client, message: Message):
+    args = message.text.split()
+    if len(args) < 2: return await message.reply_text("Usage: `/settime 10:00 20:30` (24hr format)")
+    
+    scheduler.remove_all_jobs()
+    times_list = args[1:]
+    for t in times_list:
         try:
-            await message.reply_to_message.copy(chat_id=user["user_id"])
-            count += 1
-            await asyncio.sleep(0.3)
-        except:
-            await users_db.delete_one({"user_id": user["user_id"]})
-            deleted += 1
-    await msg.edit(f"✅ **Broadcast Done!**\n\nSent: `{count}`\nBlocked/Deleted: `{deleted}`")
-
-@pr0fess0r_99.on_message(filters.command("edit") & filters.user(ADMINS))
-async def edit_buttons(client, message: Message):
-    args = message.text.split(None, 3)
-    if len(args) < 4:
-        return await message.reply_text("Usage: `/edit 1 Name Link` (_ for spaces)")
+            h, m = t.split(':')
+            scheduler.add_job(auto_post_job, "cron", hour=int(h), minute=int(m))
+        except: continue
     
-    num, name, link = args[1], args[2], args[3]
-    if not link.startswith("http"):
-        return await message.reply_text("❌ Error: Link must start with http:// or https://")
-        
-    current = await get_buttons()
-    if num == "1": current[0]['n1'], current[0]['u1'] = name.replace("_", " "), link
-    elif num == "2": current[1]['n2'], current[1]['u2'] = name.replace("_", " "), link
-    elif num == "3": current[1]['n3'], current[1]['u3'] = name.replace("_", " "), link
-    
-    await settings_db.update_one({"id": "start_buttons"}, {"$set": {"data": current}}, upsert=True)
-    await message.reply_text(f"✅ Button {num} updated successfully!")
+    await settings_db.update_one({"id": "sch_t"}, {"$set": {"times": times_list}}, upsert=True)
+    await message.reply_text(f"✅ Post timings set for: {', '.join(times_list)}")
 
-# --- BOT STARTUP LOGIC ---
+@pr0fess0r_99.on_callback_query(filters.regex("close_msg"))
+async def close(client, query): await query.message.delete()
+
+@pr0fess0r_99.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message):
+    await add_user(message.from_user.id)
+    await message.reply_text("Bot is Online! Use /settime to schedule posts.")
+
+# --- STARTUP ---
 async def start_bot():
     await pr0fess0r_99.start()
-    # Menu Button configuration
+    
+    saved = await settings_db.find_one({"id": "sch_t"})
+    if saved:
+        for t in saved['times']:
+            h, m = t.split(':')
+            scheduler.add_job(auto_post_job, "cron", hour=int(h), minute=int(m))
+    
+    scheduler.start()
     await pr0fess0r_99.set_bot_commands([
-        BotCommand("start", "Start Bot 🚀"),
-        BotCommand("stats", "Bot Status/Users 📊"),
-        BotCommand("broadcast", "Send Message to All 📢"),
-        BotCommand("edit", "Change Menu Buttons 🛠️")
+        BotCommand("start", "Check Status"),
+        BotCommand("settime", "Schedule Posts (HH:MM HH:MM)")
     ])
-    print("🔥 ALL SYSTEMS ONLINE: Bot is Live!")
+    print("🚀 BOT DEPLOYED: Auto-Accept & Auto-Post Active!")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(start_bot())
+          
