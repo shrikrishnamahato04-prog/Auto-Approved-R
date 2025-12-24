@@ -1,7 +1,7 @@
 from os import environ
 import asyncio
 from pyrogram import Client, filters, idle
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, ChatJoinRequest, BotCommand
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, ChatJoinRequest, BotCommand, CallbackQuery
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- BOT SETUP ---
@@ -12,14 +12,14 @@ pr0fess0r_99 = Client(
     api_hash = environ["API_HASH"]
 )
 
-# --- DATABASE ---
+# --- DATABASE (MongoDB) ---
 mongo_url = environ["MONGO_URL"]
 db_client = AsyncIOMotorClient(mongo_url)
 db = db_client.AutoApproveBot
 users_db = db.users
 settings_db = db.settings
 
-# --- CONFIG VARS ---
+# --- CONFIG VARS (Heroku se uthayega) ---
 ADMINS = [int(admin) for admin in environ.get("ADMINS", "").split()]
 TEXT = environ.get("APPROVED_WELCOME_TEXT", "Hello {mention}\nWelcome To {title}!")
 UPDATE_CH = environ.get("UPDATE_CH", "https://t.me/Mo_Tech_YT") 
@@ -39,21 +39,27 @@ async def get_buttons():
         ]
     return btns["data"]
 
-# --- SEND MEDIA FUNCTION ---
+# --- MESSAGE SENDING LOGIC (With Photo & Buttons) ---
 async def send_msg_with_media(client, chat_id, mention, title):
     caption_text = TEXT.format(mention=mention, title=title)
     btns_data = await get_buttons()
     
+    # URL Safety: Agar link khali ho toh crash na ho
+    def check_url(url):
+        return url if (url and url.startswith("http")) else "https://t.me/telegram"
+
+    # Screenshot wala 5 Button Layout + Close Button
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(btns_data[0]['n1'], url=btns_data[0]['u1'])],
+        [InlineKeyboardButton(btns_data[0]['n1'], url=check_url(btns_data[0]['u1']))],
         [
-            InlineKeyboardButton(btns_data[1]['n2'], url=btns_data[1]['u2']),
-            InlineKeyboardButton(btns_data[1]['n3'], url=btns_data[1]['u3'])
+            InlineKeyboardButton(btns_data[1]['n2'], url=check_url(btns_data[1]['u2'])),
+            InlineKeyboardButton(btns_data[1]['n3'], url=check_url(btns_data[1]['u3']))
         ],
         [
             InlineKeyboardButton("Add to Group ➕", url=f"http://t.me/{client.me.username}?startgroup=botstart"),
             InlineKeyboardButton("Add to Channel 📢", url=f"http://t.me/{client.me.username}?startchannel=botstart")
-        ]
+        ],
+        [InlineKeyboardButton("Close ❌", callback_data="close_msg")]
     ])
 
     try:
@@ -62,9 +68,14 @@ async def send_msg_with_media(client, chat_id, mention, title):
         else:
             await client.send_message(chat_id, text=caption_text, reply_markup=keyboard)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Send Error: {e}")
 
-# --- HANDLERS ---
+# --- CALLBACKS (Cancel/Close Button ke liye) ---
+@pr0fess0r_99.on_callback_query(filters.regex("close_msg"))
+async def close(client, query: CallbackQuery):
+    await query.message.delete()
+
+# --- MAIN HANDLERS ---
 
 @pr0fess0r_99.on_chat_join_request()
 async def autoapprove(client, message: ChatJoinRequest):
@@ -72,22 +83,25 @@ async def autoapprove(client, message: ChatJoinRequest):
         await client.approve_chat_join_request(message.chat.id, message.from_user.id)
         await add_user(message.from_user.id)
         await send_msg_with_media(client, message.from_user.id, message.from_user.mention, message.chat.title)
-    except: pass
+    except Exception as e:
+        print(f"Approve Error: {e}")
 
 @pr0fess0r_99.on_message(filters.private & filters.command("start"))
 async def start(client, message: Message):
     await add_user(message.from_user.id)
     await send_msg_with_media(client, message.chat.id, message.from_user.mention, "Our Service")
 
+# --- ADMIN COMMANDS (Sirf aapke liye) ---
+
 @pr0fess0r_99.on_message(filters.command("stats") & filters.user(ADMINS))
 async def stats_handler(client, message):
     count = await users_db.count_documents({})
-    await message.reply_text(f"📊 **Total Users:** `{count}`")
+    await message.reply_text(f"📊 **Bot Current Status**\n\nTotal Users: `{count}`\nDatabase: `MongoDB Active`")
 
 @pr0fess0r_99.on_message(filters.command("broadcast") & filters.user(ADMINS) & filters.reply)
 async def broadcast_handler(client, message):
     all_users = users_db.find({})
-    msg = await message.reply_text("🚀 Broadcast In Progress...")
+    msg = await message.reply_text("🚀 **Broadcast started...**")
     count, deleted = 0, 0
     async for user in all_users:
         try:
@@ -97,33 +111,38 @@ async def broadcast_handler(client, message):
         except:
             await users_db.delete_one({"user_id": user["user_id"]})
             deleted += 1
-    await msg.edit(f"✅ Sent: `{count}` | Deleted: `{deleted}`")
+    await msg.edit(f"✅ **Broadcast Done!**\n\nSent: `{count}`\nBlocked/Deleted: `{deleted}`")
 
 @pr0fess0r_99.on_message(filters.command("edit") & filters.user(ADMINS))
 async def edit_buttons(client, message: Message):
     args = message.text.split(None, 3)
     if len(args) < 4:
-        return await message.reply_text("Usage: `/edit 1 Name Link` (_ for space)")
+        return await message.reply_text("Usage: `/edit 1 Name Link` (_ for spaces)")
+    
     num, name, link = args[1], args[2], args[3]
+    if not link.startswith("http"):
+        return await message.reply_text("❌ Error: Link must start with http:// or https://")
+        
     current = await get_buttons()
     if num == "1": current[0]['n1'], current[0]['u1'] = name.replace("_", " "), link
     elif num == "2": current[1]['n2'], current[1]['u2'] = name.replace("_", " "), link
     elif num == "3": current[1]['n3'], current[1]['u3'] = name.replace("_", " "), link
+    
     await settings_db.update_one({"id": "start_buttons"}, {"$set": {"data": current}}, upsert=True)
-    await message.reply_text(f"✅ Button {num} Updated!")
+    await message.reply_text(f"✅ Button {num} updated successfully!")
 
-# --- START BOT ---
+# --- BOT STARTUP LOGIC ---
 async def start_bot():
     await pr0fess0r_99.start()
+    # Menu Button configuration
     await pr0fess0r_99.set_bot_commands([
-        BotCommand("start", "🚀 Start Bot"),
-        BotCommand("stats", "📊 Check Stats"),
-        BotCommand("broadcast", "📢 Broadcast"),
-        BotCommand("edit", "🛠️ Edit Buttons")
+        BotCommand("start", "Start Bot 🚀"),
+        BotCommand("stats", "Bot Status/Users 📊"),
+        BotCommand("broadcast", "Send Message to All 📢"),
+        BotCommand("edit", "Change Menu Buttons 🛠️")
     ])
-    print("🔥 BOT IS LIVE!")
+    print("🔥 ALL SYSTEMS ONLINE: Bot is Live!")
     await idle()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_bot())
+    asyncio.get_event_loop().run_until_complete(start_bot())
